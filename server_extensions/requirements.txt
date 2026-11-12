@@ -1,0 +1,4 @@
+# Keep the runtime and code generator compatible with the checked-in stubs.
+grpcio==1.85.1
+grpcio-tools==1.85.1
+protobuf==7.36.2

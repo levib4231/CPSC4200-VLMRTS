@@ -1,0 +1,2 @@
+# Unified diff context intentionally prefixes tab-indented lines with a space.
+server_extensions/*.patch -whitespace

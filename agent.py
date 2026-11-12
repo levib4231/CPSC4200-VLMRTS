@@ -25,7 +25,16 @@ DEFAULT_MODEL = "qwen3-omni-30b-a3b"
 DEFAULT_SERVER_URL = "http://127.0.0.1:8000"
 DEFAULT_MAP = "vlm-singles.oramap"
 BUNDLED_MAP = Path(__file__).resolve().parent / "maps" / DEFAULT_MAP
-ALLOWED_ACTIONS = {"ATTACK", "MOVE", "RETREAT", "HOLD"}
+ALLOWED_ACTIONS = {"ATTACK", "MOVE", "RETREAT", "HOLD", "BUILD_UNIT", "BUILD_STRUCTURE", "DEPLOY"}
+PERSONALITIES = {"selfish", "helpful", "balanced"}
+PERSONALITY_PROFILES = {
+    "selfish": {"ally_threat_radius": 0.0, "own_base_priority_radius": 18.0, "retreat_when_unthreatened": True},
+    "helpful": {"ally_threat_radius": 12.0, "own_base_priority_radius": 18.0, "retreat_when_unthreatened": False},
+    "balanced": {"ally_threat_radius": 8.0, "own_base_priority_radius": 18.0, "retreat_when_unthreatened": False},
+}
+ECONOMY_CONTROLS = {"bootstrap", "hybrid", "vlm"}
+MAX_OWN_UNITS = 32
+MIN_SPEND_RESERVE = 500
 OPENRA_BOT_TYPES = {
     "beginner": "normal",
     "easy": "normal",
@@ -40,14 +49,13 @@ OPENRA_BOT_TYPES = {
 }
 
 SYSTEM_PROMPT = """You control one Red Alert player through OpenRA-RL.
-Choose exactly one constrained action: ATTACK, MOVE, RETREAT, or HOLD.
-Return one JSON object and no markdown:
-{"action":"ATTACK|MOVE|RETREAT|HOLD","unit_ids":[101],"target_id":201,"target":{"x":0,"y":0},"reason":"brief observable reason"}
-Use only actor ids and map cells in the supplied state. ATTACK requires a visible
-enemy target_id. MOVE requires a map-cell target. RETREAT sends units toward the
-friendly base; target is optional. HOLD stops selected units. If no enemy is visible,
-use MOVE to scout toward the far side of the map when combat units are available.
-Never invent ids. Keep the reason under 20 words.
+Choose exactly one action: ATTACK, MOVE, RETREAT, HOLD, BUILD_UNIT,
+BUILD_STRUCTURE, or DEPLOY. Return one JSON object and no markdown:
+{"action":"ATTACK|MOVE|RETREAT|HOLD|BUILD_UNIT|BUILD_STRUCTURE|DEPLOY","unit_ids":[101],"target_id":201,"target":{"x":0,"y":0},"unit_type":"e1","structure_type":"powr","count":1,"reason":"brief observable reason"}
+Use only supplied actor ids and available_production. BUILD_UNIT needs unit_type,
+BUILD_STRUCTURE needs structure_type, and DEPLOY needs an owned deployable unit id.
+ATTACK needs a visible enemy; MOVE needs a map cell; RETREAT returns to base;
+HOLD stops units. Never invent ids. Keep reason under 20 words.
 """
 
 
@@ -62,6 +70,9 @@ class Action:
     target_id: int | None = None
     target: tuple[float, float] | None = None
     reason: str = ""
+    unit_type: str | None = None
+    structure_type: str | None = None
+    count: int = 1
 
 
 def _json_from_text(text: str) -> Mapping[str, Any]:
@@ -121,12 +132,18 @@ def parse_action(value: str | Mapping[str, Any]) -> Action:
         if not all(math.isfinite(v) for v in target):
             raise ActionParseError("target coordinates must be finite")
 
+    count = obj.get("count", 1)
+    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 5:
+        raise ActionParseError("count must be an integer from 1 to 5")
     return Action(
         action=action,
         unit_ids=unit_ids,
         target_id=target_id,
         target=target,
         reason=str(obj.get("reason", "")).strip()[:300],
+        unit_type=str(obj["unit_type"]).lower() if obj.get("unit_type") else None,
+        structure_type=str(obj["structure_type"]).lower() if obj.get("structure_type") else None,
+        count=count,
     )
 
 
@@ -142,22 +159,53 @@ def _unit_id(item: Mapping[str, Any]) -> int | None:
     return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _own_units(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    return _units(state, "units_summary") or _units(state, "units")
+
+
 def _friendly_ids(state: Mapping[str, Any]) -> list[int]:
-    result = []
-    for item in _units(state, "units_summary") or _units(state, "units"):
-        value = _unit_id(item)
-        if value is not None:
-            result.append(value)
-    return result
+    return [value for item in _own_units(state) if (value := _unit_id(item)) is not None]
+
+
+def _economy_cash(state: Mapping[str, Any]) -> float | None:
+    economy = state.get("economy")
+    cash = economy.get("cash") if isinstance(economy, Mapping) else state.get("cash", state.get("money"))
+    return float(cash) if isinstance(cash, (int, float)) and not isinstance(cash, bool) else None
+
+
+def _item_cost(action: Action, state: Mapping[str, Any]) -> int | None:
+    advertised = state.get("production_costs") or state.get("item_costs") or {}
+    key = action.unit_type if action.action == "BUILD_UNIT" else action.structure_type
+    if isinstance(advertised, Mapping) and key in advertised and isinstance(advertised[key], (int, float)):
+        return int(advertised[key])
+    try:
+        from openra_env.game_data import RA_BUILDINGS, RA_UNITS
+        item = (RA_UNITS if action.action == "BUILD_UNIT" else RA_BUILDINGS).get(key or "")
+        cost = item.get("cost") if item else None
+        return int(cost) if isinstance(cost, (int, float)) else None
+    except (ImportError, AttributeError):
+        return None
 
 
 def _enemy_ids(state: Mapping[str, Any]) -> list[int]:
+    own_team = state.get("team", state.get("team_id"))
+    own_player = state.get("player", state.get("player_id"))
+    own_owners = {str(item.get("owner")) for item in (_units(state, "units_summary") or _units(state, "units")) if item.get("owner")}
+    ally_ids = {_unit_id(item) for item in (_units(state, "allies_summary") or _units(state, "allied_units"))}
     result = []
     seen: set[int] = set()
-    for key in ("enemy_summary", "enemy_buildings_summary", "visible_enemies"):
+    for key in ("enemy_summary", "enemy_buildings_summary", "visible_enemies", "visible_enemy_buildings"):
         for item in _units(state, key):
+            team = item.get("team", item.get("team_id"))
+            player = item.get("player", item.get("player_id"))
+            if team is not None and own_team is not None and team == own_team:
+                continue
+            if player is not None and own_player is not None and player == own_player:
+                continue
+            if item.get("owner") and str(item.get("owner")) in own_owners:
+                continue
             value = _unit_id(item)
-            if value is not None and value not in seen:
+            if value is not None and value not in seen and value not in ally_ids:
                 seen.add(value)
                 result.append(value)
     return result
@@ -213,54 +261,135 @@ def _scout_target(state: Mapping[str, Any]) -> tuple[float, float]:
     )
 
 
-def fallback_action(state: Mapping[str, Any]) -> Action:
-    friendly = _friendly_ids(state)
-    enemy = _enemy_ids(state)
-    if friendly and enemy:
-        return Action("ATTACK", friendly, target_id=enemy[0], reason="safe local fallback")
+def _cell(item: Mapping[str, Any]) -> tuple[float, float] | None:
+    try:
+        x, y = float(item.get("cell_x", item.get("x"))), float(item.get("cell_y", item.get("y")))
+        return (x, y) if math.isfinite(x) and math.isfinite(y) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _distance(a: Mapping[str, Any], b: Mapping[str, Any]) -> float:
+    pa, pb = _cell(a), _cell(b)
+    return math.dist(pa, pb) if pa and pb else math.inf
+
+
+def fallback_action(state: Mapping[str, Any], personality: str = "balanced") -> Action:
     combat = _combat_ids(state)
-    if combat:
-        return Action("MOVE", combat, target=_scout_target(state), reason="scout for enemy")
-    return Action("HOLD", friendly, reason="no combat units")
+    if not combat:
+        return Action("HOLD", [], reason="no combat-capable units")
+    enemies = [item for key in ("enemy_summary", "enemy_buildings_summary", "visible_enemies", "visible_enemy_buildings") for item in _units(state, key) if _unit_id(item) in _enemy_ids(state)]
+    allies = _units(state, "allies_summary") or _units(state, "allied_units")
+    own_base = _base_target(state)
+    profile = PERSONALITY_PROFILES.get(personality, PERSONALITY_PROFILES["balanced"])
+    threatened_base = any((_cell(e) and math.dist(_cell(e), own_base) <= profile["own_base_priority_radius"]) for e in enemies)
+    if enemies and threatened_base:
+        target = min(enemies, key=lambda enemy: _distance(enemy, {"cell_x": own_base[0], "cell_y": own_base[1]}))
+        return Action("ATTACK", combat, target_id=_unit_id(target), reason="defend own base")
+    ally_threats = [(ally, enemy) for ally in allies for enemy in enemies
+                    if profile["ally_threat_radius"] > 0 and _distance(ally, enemy) <= profile["ally_threat_radius"]]
+    if ally_threats:
+        # Only use ally observations explicitly supplied by the environment.
+        target = min(ally_threats, key=lambda pair: _distance(pair[0], pair[1]))[1]
+        return Action("ATTACK", combat, target_id=_unit_id(target), reason="protect observed ally under threat")
+    if enemies:
+        if profile["retreat_when_unthreatened"]:
+            return Action("RETREAT", combat, reason="preserve own forces")
+        return Action("ATTACK", combat, target_id=_unit_id(enemies[0]), reason="safe local fallback")
+    return Action("MOVE", combat, target=_scout_target(state), reason="scout for enemy")
 
 
 def sanitize_action(action: Action, state: Mapping[str, Any]) -> Action:
-    friendly = _friendly_ids(state)
+    own = _own_units(state)
+    by_id = {_unit_id(item): item for item in own if _unit_id(item) is not None}
     enemy = _enemy_ids(state)
-    selected = [unit_id for unit_id in action.unit_ids if unit_id in friendly]
-    if not selected:
-        selected = friendly
+    if action.action in {"BUILD_UNIT", "BUILD_STRUCTURE"}:
+        key = action.unit_type if action.action == "BUILD_UNIT" else action.structure_type
+        available = {str(value).lower() for value in (state.get("available_production") or [])}
+        cost = _item_cost(action, state)
+        cash = _economy_cash(state)
+        # Team observations retain exact remaining costs; legacy MCP exposes
+        # only production_items, for which full costs are a conservative bound.
+        queued = state.get("production") or state.get("production_items") or []
+        queued_types = {str(q.get("item", q.get("type", ""))).lower() for q in queued if isinstance(q, Mapping)}
+        queued_types.update(str(q).split("@", 1)[0].lower() for q in queued if isinstance(q, str))
+        if not key or key.lower() not in available or key.lower() in queued_types or cost is None or cash is None:
+            return Action("HOLD", [], reason="economy order unavailable or cost unknown")
+        pending_cost = 0
+        for entry in queued:
+            if isinstance(entry, Mapping):
+                remaining = entry.get("remaining_cost")
+                if not isinstance(remaining, (int, float)) or isinstance(remaining, bool):
+                    return Action("HOLD", [], reason="queued production cost unknown")
+                pending_cost += max(0, int(remaining))
+            elif isinstance(entry, str):
+                pending_item = entry.split("@", 1)[0].lower()
+                pending_action = Action("BUILD_UNIT", [], unit_type=pending_item)
+                pending_unit_cost = _item_cost(pending_action, state)
+                if pending_unit_cost is None:
+                    pending_action = Action("BUILD_STRUCTURE", [], structure_type=pending_item)
+                    pending_unit_cost = _item_cost(pending_action, state)
+                if pending_unit_cost is None:
+                    return Action("HOLD", [], reason="queued production cost unknown")
+                pending_cost += pending_unit_cost
+        total_cost = cost * (action.count if action.action == "BUILD_UNIT" else 1)
+        if cash - pending_cost - total_cost < MIN_SPEND_RESERVE:
+            return Action("HOLD", [], reason="economy reserve would be breached")
+        if action.action == "BUILD_UNIT":
+            queued_units = 0
+            for entry in queued:
+                item = (entry.split("@", 1)[0] if isinstance(entry, str)
+                        else entry.get("item", entry.get("type", "")))
+                pending = Action("BUILD_UNIT", [], unit_type=str(item).lower())
+                if _item_cost(pending, state) is not None:
+                    count = entry.get("count", 1) if isinstance(entry, Mapping) else 1
+                    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+                        return Action("HOLD", [], reason="queued unit count unknown")
+                    queued_units += count
+            if len(own) + queued_units + action.count > MAX_OWN_UNITS:
+                return Action("HOLD", [], reason="projected unit cap exceeded")
+        width, height = _map_size(state)
+        if action.target is not None:
+            if width <= 0 or height <= 0 or not (0 <= action.target[0] < width and 0 <= action.target[1] < height):
+                return Action("HOLD", [], reason="economy placement outside known map")
+        return replace(action, unit_ids=[], count=action.count)
 
-    if action.action == "ATTACK":
-        target_id = action.target_id if action.target_id in enemy else (enemy[0] if enemy else None)
-        if target_id is None:
-            combat = _combat_ids(state)
-            if combat:
-                return Action("MOVE", combat, target=_scout_target(state), reason="scout for enemy")
-            return Action("HOLD", selected, reason="no visible enemy")
-        return replace(action, unit_ids=selected, target_id=target_id, target=None)
+    if action.action == "DEPLOY":
+        deployable = {i for i, item in by_id.items() if item.get("deployable") or item.get("type") == "mcv"}
+        chosen = next((i for i in action.unit_ids if i in deployable), None)
+        return replace(action, unit_ids=[chosen]) if chosen is not None else Action("HOLD", [], reason="no owned deployable unit")
 
-    if action.action == "HOLD" and not enemy:
-        combat = _combat_ids(state)
-        if combat:
-            return Action("MOVE", combat, target=_scout_target(state), reason="scout for enemy")
-
-    if action.action == "RETREAT":
-        return replace(action, unit_ids=selected, target=_base_target(state), target_id=None)
-
-    if action.action == "MOVE" and action.target is None:
-        action = replace(action, target=_base_target(state))
-    width, height = _map_size(state)
-    if action.target is not None and width > 0 and height > 0:
-        action = replace(
-            action,
-            target=(
-                max(0.0, min(float(width - 1), action.target[0])),
-                max(0.0, min(float(height - 1), action.target[1])),
-            ),
-        )
-    return replace(action, unit_ids=selected)
-
+    if action.action in {"ATTACK", "MOVE", "RETREAT", "HOLD"}:
+        explicit = bool(action.unit_ids)
+        if explicit and any(i not in by_id for i in action.unit_ids):
+            return Action("HOLD", [], reason="unknown friendly actor id")
+        if action.action == "ATTACK":
+            allowed = {i for i, item in by_id.items() if item.get("can_attack", False)}
+            selected = [i for i in action.unit_ids if i in allowed] if explicit else list(allowed)
+        elif action.action in {"MOVE", "RETREAT"}:
+            # Explicitly named own units may be noncombat (for example a
+            # harvester); implicit selection is deliberately combat-only.
+            allowed = set(by_id) if explicit else {i for i, item in by_id.items() if item.get("can_attack", False)}
+            selected = [i for i in action.unit_ids if i in allowed] if explicit else list(allowed)
+        else:
+            selected = [i for i in action.unit_ids if i in by_id] if explicit else [i for i, item in by_id.items() if item.get("can_attack", False)]
+        if not selected:
+            return Action("HOLD", [], reason="no eligible owned units")
+        if action.action == "ATTACK":
+            target = action.target_id if action.target_id in enemy else (enemy[0] if enemy else None)
+            if target is None:
+                return Action("HOLD", selected, reason="no visible enemy")
+            return replace(action, unit_ids=selected, target_id=target, target=None)
+        if action.action == "RETREAT":
+            return replace(action, unit_ids=selected, target=_base_target(state), target_id=None)
+        if action.action == "MOVE":
+            target = action.target or _base_target(state)
+            width, height = _map_size(state)
+            if width <= 0 or height <= 0 or not all(math.isfinite(v) for v in target):
+                return Action("HOLD", [], reason="move requires known map coordinates")
+            return replace(action, unit_ids=selected, target=(max(0.0, min(width - 1.0, target[0])), max(0.0, min(height - 1.0, target[1]))))
+        return replace(action, unit_ids=selected)
+    return Action("HOLD", [], reason="unsupported sanitized action")
 
 def _message_text(payload: Mapping[str, Any]) -> str:
     choices = payload.get("choices") or []
@@ -286,8 +415,14 @@ class RCDVLM:
         self.timeout = timeout
         self.session = requests.Session()
 
-    def choose(self, state: Mapping[str, Any]) -> tuple[Action, str]:
+    def choose(self, state: Mapping[str, Any], personality: str = "balanced") -> tuple[Action, str]:
+        guidance = {
+            "selfish": "Prioritize own base and army; retreat from enemies outside 18 cells of your base, and never assume ally support.",
+            "helpful": "Defend own base if an enemy is within 18 cells; otherwise help explicitly observed allies threatened within 12 cells.",
+            "balanced": "Defend own base within 18 cells; otherwise help explicitly observed allies threatened within 8 cells."
+        }[personality]
         prompt = (
+            f"Personality: {guidance}\\n"
             "Structured OpenRA-RL game state (authoritative for actor ids and map cells):\n"
             + json.dumps(state, separators=(",", ":"), sort_keys=True)
             + "\nReturn the JSON action now."
@@ -360,22 +495,26 @@ class BootstrapController:
             return None
 
         barracks = next((name for name in ("tent", "barr") if name in buildings), None)
-        if "powr" not in buildings and "powr" not in production and "powr" in available:
+        cash = _economy_cash(state)
+        if cash is None or cash < MIN_SPEND_RESERVE:
+            return None
+
+        if "powr" not in buildings and "powr" not in production and "powr" in available and sanitize_action(Action("BUILD_STRUCTURE", [], structure_type="powr"), state).action == "BUILD_STRUCTURE":
             result = await game.call_tool("build_and_place", building_type="powr")
             self._record_result(tick, result)
             return {"phase": "build_base", "building": "powr", "result": result}
         if barracks is None:
             barracks_type = next((name for name in ("tent", "barr") if name in available), None)
-            if barracks_type and barracks_type not in production:
+            if barracks_type and barracks_type not in production and sanitize_action(Action("BUILD_STRUCTURE", [], structure_type=barracks_type), state).action == "BUILD_STRUCTURE":
                 result = await game.call_tool("build_and_place", building_type=barracks_type)
                 self._record_result(tick, result)
                 return {"phase": "build_base", "building": barracks_type, "result": result}
             return None
-        if "proc" not in buildings and "proc" not in production and "proc" in available:
+        if "proc" not in buildings and "proc" not in production and "proc" in available and sanitize_action(Action("BUILD_STRUCTURE", [], structure_type="proc"), state).action == "BUILD_STRUCTURE":
             result = await game.call_tool("build_and_place", building_type="proc")
             self._record_result(tick, result)
             return {"phase": "build_base", "building": "proc", "result": result}
-        if "weap" not in buildings and "weap" not in production and "weap" in available:
+        if "weap" not in buildings and "weap" not in production and "weap" in available and sanitize_action(Action("BUILD_STRUCTURE", [], structure_type="weap"), state).action == "BUILD_STRUCTURE":
             result = await game.call_tool("build_and_place", building_type="weap")
             self._record_result(tick, result)
             return {"phase": "build_base", "building": "weap", "result": result}
@@ -383,7 +522,11 @@ class BootstrapController:
         own_units = _units(state, "units_summary")
         for item_type, target_count in self.training_targets.items():
             count = sum(1 for unit in own_units if unit.get("type") == item_type)
+            if len(own_units) >= MAX_OWN_UNITS:
+                return None
             if count >= target_count or item_type in production or item_type not in available:
+                continue
+            if sanitize_action(Action("BUILD_UNIT", [], unit_type=item_type), state).action != "BUILD_UNIT":
                 continue
             result = await game.call_tool("build_unit", unit_type=item_type, count=1)
             self._record_result(tick, result)
@@ -396,7 +539,11 @@ class BootstrapController:
 
 
 class DecisionEngine:
-    def __init__(self, vlm: RCDVLM | None, output_dir: Path) -> None:
+    def __init__(self, vlm: RCDVLM | None, output_dir: Path, personality: str = "balanced", economy_control: str = "bootstrap") -> None:
+        if personality not in PERSONALITIES or economy_control not in ECONOMY_CONTROLS:
+            raise ValueError("invalid personality or economy control")
+        self.personality = personality
+        self.economy_control = economy_control
         self.vlm = vlm
         self.output_dir = output_dir
         self.log_path = output_dir / "events.jsonl"
@@ -412,16 +559,29 @@ class DecisionEngine:
         raw_text = ""
         error = None
         if self.vlm is None:
-            action = fallback_action(state)
+            action = fallback_action(state, self.personality)
+            source = "fallback"
         else:
             try:
-                action, raw_text = self.vlm.choose(state)
+                action, raw_text = self.vlm.choose(state, self.personality)
+                source = "vlm"
             except Exception as exc:  # keep the episode alive if the model fails
-                action, error = fallback_action(state), str(exc)
+                action, error = fallback_action(state, self.personality), str(exc)
+                source = "fallback"
+        proposed_action = action
         action = sanitize_action(action, state)
+        if self.economy_control == "bootstrap" and action.action in {"BUILD_UNIT", "BUILD_STRUCTURE", "DEPLOY"}:
+            action = Action("HOLD", [], reason="economy controlled by bootstrap")
+        sanitized = proposed_action != action
+        decision_source = "vlm_rejected" if sanitized and source == "vlm" else source
         self.log(
             {
                 "event": "decision",
+                "decision_source": decision_source,
+                "personality": self.personality,
+                "observation_counts": {"own_units": len(_own_units(state)), "visible_enemies": len(_enemy_ids(state)), "explicit_allies": len(_units(state, "allies_summary") or _units(state, "allied_units"))},
+                "proposed_action": asdict(proposed_action),
+                "action_sanitized": sanitized,
                 "latency_ms": round((time.perf_counter() - started) * 1000.0, 2),
                 "state": state,
                 "action": asdict(action),
@@ -530,6 +690,27 @@ def _configure_local_server(server_url: str, map_name: str, difficulty: str) -> 
         Path(config_path).unlink(missing_ok=True)
 
 
+async def probe_server_capabilities(server_url: str) -> dict[str, Any]:
+    """Report actual advertised tools and live observation fields without inventing support."""
+    from openra_env.mcp_ws_client import OpenRAMCPClient
+    async with OpenRAMCPClient(server_url) as game:
+        tools = await game.list_tools(use_cache=False)
+        try:
+            state = await game.call_tool("get_game_state")
+            if isinstance(state, Mapping) and state.get("error"):
+                raise RuntimeError(str(state["error"]))
+        except Exception as exc:
+            state = {}
+            observation_error = str(exc)
+        else:
+            observation_error = None
+        fields = sorted(state.keys()) if isinstance(state, Mapping) else []
+        allies = any(k in fields for k in ("allies_summary", "allied_units", "ally_observations"))
+        return {"tools": sorted(tool.name for tool in tools), "observation_fields": fields,
+                "explicit_ally_observations": allies, "multi_slot_team_control": False,
+                "observation_error": observation_error}
+
+
 async def _prepare_game(game: Any) -> dict[str, Any]:
     state = await game.call_tool("get_game_state")
     try:
@@ -546,9 +727,30 @@ async def _prepare_game(game: Any) -> dict[str, Any]:
     return await game.call_tool("get_game_state")
 
 
+def _defer_vlm_economy(action: Action, bootstrap_result: Mapping[str, Any] | None) -> Action:
+    if bootstrap_result and action.action in {"BUILD_UNIT", "BUILD_STRUCTURE", "DEPLOY"}:
+        return Action("HOLD", [], reason="VLM economy order deferred during bootstrap mutation")
+    return action
+
+
+def _suppress_order_during_deploy(action: Action, bootstrap_result: Mapping[str, Any] | None) -> Action:
+    if bootstrap_result and str(bootstrap_result.get("phase", "")).startswith("deploy"):
+        return Action("HOLD", [], reason="bootstrap deployment")
+    return action
+
+
 async def _issue_action(game: Any, action: Action) -> Any:
+    if action.action == "BUILD_UNIT" and action.unit_type:
+        return await game.call_tool("build_unit", unit_type=action.unit_type, count=action.count)
+    if action.action == "BUILD_STRUCTURE" and action.structure_type:
+        args: dict[str, Any] = {"building_type": action.structure_type}
+        if action.target is not None:
+            args.update(cell_x=round(action.target[0]), cell_y=round(action.target[1]))
+        return await game.call_tool("build_and_place", **args)
+    if action.action == "DEPLOY" and action.unit_ids:
+        return await game.call_tool("deploy_unit", unit_id=action.unit_ids[0])
     if not action.unit_ids:
-        return {"note": "no friendly units"}
+        return {"note": "no eligible friendly units"}
     unit_ids = ",".join(str(unit_id) for unit_id in action.unit_ids)
     if action.action == "ATTACK" and action.target_id is not None:
         return await game.call_tool("attack_target", unit_ids=unit_ids, target_actor_id=action.target_id)
@@ -565,7 +767,7 @@ async def _issue_action(game: Any, action: Action) -> Any:
 async def run_episode(args: argparse.Namespace, engine: DecisionEngine) -> int:
     from openra_env.mcp_ws_client import OpenRAMCPClient
 
-    bootstrap = BootstrapController() if args.bootstrap else None
+    bootstrap = BootstrapController() if args.economy_control in {"bootstrap", "hybrid"} and args.bootstrap else None
     reset_args: dict[str, Any] = {"bot_type": args.difficulty, "map_name": args.map}
     if args.map == DEFAULT_MAP and BUNDLED_MAP.is_file():
         reset_args["map_data"] = base64.b64encode(BUNDLED_MAP.read_bytes()).decode("ascii")
@@ -595,12 +797,18 @@ async def run_episode(args: argparse.Namespace, engine: DecisionEngine) -> int:
 
             # Do not issue a combat order on the same tick as MCV deployment;
             # Stop/Move can cancel the deployment before it becomes a fact.
-            if bootstrap_result and bootstrap_result.get("phase") == "deploy_mcv":
+            if bootstrap_result and str(bootstrap_result.get("phase", "")).startswith("deploy"):
                 action = Action("HOLD", [], reason="bootstrap deployment")
-                action_result = {"note": "combat order skipped during MCV deployment"}
+                action_result = {"note": "all other orders skipped during deployment"}
             else:
                 action = await asyncio.to_thread(engine.decide, state)
-                action_result = await _issue_action(game, action)
+                deferred = _defer_vlm_economy(action, bootstrap_result)
+                if deferred != action:
+                    engine.log({"event": "action_deferred", "decision_source": "deferred", "reason": deferred.reason,
+                               "proposed_action": asdict(action), "bootstrap_phase": bootstrap_result.get("phase")})
+                    action, action_result = deferred, {"note": "VLM economy order deferred; bootstrap mutated economy this tick"}
+                else:
+                    action_result = await _issue_action(game, action)
             advance_result = await game.call_tool("advance", ticks=args.advance_ticks)
             engine.log(
                 {
@@ -633,19 +841,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--advance-ticks", type=int, default=25)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--no-vlm", action="store_true", help="use deterministic fallback actions")
+    parser.add_argument("--personality", choices=sorted(PERSONALITIES), default="balanced")
+    parser.add_argument("--economy-control", choices=sorted(ECONOMY_CONTROLS), default="bootstrap")
     parser.add_argument("--no-bootstrap", dest="bootstrap", action="store_false", help="disable automatic MCV deployment and base/army setup")
     parser.set_defaults(bootstrap=True)
     parser.add_argument("--start-server", action="store_true", help="start the official OpenRA-RL Docker server")
     parser.add_argument("--headless", action="store_true", help="accepted for compatibility; OpenRA-RL is headless by default")
+    parser.add_argument("--probe-capabilities", action="store_true", help="list live MCP tools and observed team capabilities; do not start a game")
     args = parser.parse_args(argv)
     args.advance_ticks = max(1, min(args.advance_ticks, 50))
+    if args.probe_capabilities:
+        print(json.dumps(asyncio.run(probe_server_capabilities(args.server_url)), sort_keys=True))
+        return 0
 
     output_dir = args.output_dir or Path("runs") / datetime.now().strftime("%Y%m%d_%H%M%S")
     started_server = _ensure_server(args.server_url, args.difficulty, args.start_server)
     del started_server  # The official server is intentionally left running for reuse.
     _configure_local_server(args.server_url, args.map, args.difficulty)
     vlm = None if args.no_vlm else RCDVLM(_load_credentials(), args.model, args.base_url, args.request_timeout)
-    return asyncio.run(run_episode(args, DecisionEngine(vlm, output_dir)))
+    return asyncio.run(run_episode(args, DecisionEngine(vlm, output_dir, args.personality, args.economy_control)))
 
 
 if __name__ == "__main__":

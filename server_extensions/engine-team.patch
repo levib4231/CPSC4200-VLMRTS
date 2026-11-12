@@ -1,0 +1,804 @@
+diff --git a/OpenRA.Mods.Common/Traits/Player/ActionHandler.cs b/OpenRA.Mods.Common/Traits/Player/ActionHandler.cs
+index 9a8d5a9..f12746b 100644
+--- a/OpenRA.Mods.Common/Traits/Player/ActionHandler.cs
++++ b/OpenRA.Mods.Common/Traits/Player/ActionHandler.cs
+@@ -33,12 +33,70 @@ public void ProcessAction(RLProto.AgentAction agentAction, IBot bot)
+ 		{
+ 			foreach (var command in agentAction.Commands)
+ 			{
++				if (!ValidateCommand(command, out var error))
++				{
++					Log.Write("rl-bridge", $"Rejected command for {player.InternalName}: {error}");
++					continue;
++				}
++
+ 				var order = ConvertCommand(command);
+ 				if (order != null)
+ 					bot.QueueOrder(order);
+ 			}
+ 		}
+ 
++		public bool ValidateAction(RLProto.AgentAction action, out string error)
++		{
++			foreach (var command in action.Commands)
++				if (!ValidateCommand(command, out error))
++					return false;
++
++			error = null;
++			return true;
++		}
++
++		bool ValidateCommand(RLProto.Command command, out string error)
++		{
++			var requiresSubject = command.Action is RLProto.ActionType.Move
++				or RLProto.ActionType.AttackMove or RLProto.ActionType.Attack or RLProto.ActionType.Stop
++				or RLProto.ActionType.Harvest or RLProto.ActionType.Deploy or RLProto.ActionType.Sell
++				or RLProto.ActionType.Repair or RLProto.ActionType.SetRallyPoint or RLProto.ActionType.Guard
++				or RLProto.ActionType.SetStance or RLProto.ActionType.EnterTransport or RLProto.ActionType.Unload
++				or RLProto.ActionType.PowerDown or RLProto.ActionType.SetPrimary;
++
++			if (requiresSubject && command.ActorId == 0)
++			{
++				error = $"{command.Action} requires an actor_id";
++				return false;
++			}
++
++			if (command.ActorId != 0)
++			{
++				var subject = world.GetActorById(command.ActorId);
++				if (subject == null || subject.IsDead || !subject.IsInWorld || subject.Owner != player)
++				{
++					error = $"actor {command.ActorId} is not owned by {player.InternalName}";
++					return false;
++				}
++			}
++
++			if (command.Action == RLProto.ActionType.Attack && command.TargetActorId != 0)
++			{
++				var target = world.GetActorById(command.TargetActorId);
++				if (target == null || target.IsDead || !target.IsInWorld
++					|| target.Owner == null || target.Owner.NonCombatant
++					|| player.RelationshipWith(target.Owner) != PlayerRelationship.Enemy
++					|| !player.Shroud.IsVisible(target.CenterPosition))
++				{
++					error = $"attack target {command.TargetActorId} is not a visible enemy";
++					return false;
++				}
++			}
++
++			error = null;
++			return true;
++		}
++
+ 		Order ConvertCommand(RLProto.Command cmd)
+ 		{
+ 			switch (cmd.Action)
+diff --git a/OpenRA.Mods.Common/Traits/Player/ExternalBotBridge.cs b/OpenRA.Mods.Common/Traits/Player/ExternalBotBridge.cs
+index 998a147..6c2ea4f 100644
+--- a/OpenRA.Mods.Common/Traits/Player/ExternalBotBridge.cs
++++ b/OpenRA.Mods.Common/Traits/Player/ExternalBotBridge.cs
+@@ -23,6 +23,7 @@
+ using Microsoft.Extensions.DependencyInjection;
+ using Microsoft.Extensions.Logging;
+ using OpenRA.Traits;
++using OpenRA.Graphics;
+ using RLProto = OpenRA.Mods.Common.RL;
+ 
+ namespace OpenRA.Mods.Common.Traits
+@@ -47,13 +48,16 @@ public sealed class ExternalBotBridgeInfo : TraitInfo, IBotInfo
+ 			"1 = every tick, 10 = every 10th tick.")]
+ 		public readonly int ObservationInterval = 1;
+ 
++		[Desc("Comma-separated internal names of additional allied playable slots controlled by this bridge.")]
++		public readonly string ControlledPlayers = "";
++
+ 		string IBotInfo.Type => Type;
+ 		string IBotInfo.Name => Name;
+ 
+ 		public override object Create(ActorInitializer init) { return new ExternalBotBridge(this, init); }
+ 	}
+ 
+-	public sealed class ExternalBotBridge : ITick, IBot, INotifyCreated
++	public sealed class ExternalBotBridge : ITick, IBot, INotifyCreated, IWorldLoaded
+ 	{
+ 		/// <summary>
+ 		/// Thread-safe session registry. In multi-session mode, multiple bridges
+@@ -90,6 +94,16 @@ public sealed class ExternalBotBridge : ITick, IBot, INotifyCreated
+ 		Player player;
+ 		ObservationSerializer observationSerializer;
+ 		ActionHandler actionHandler;
++		readonly List<Player> controlledPlayers = new();
++		volatile bool teamReady;
++		string teamInitializationError;
++		readonly Dictionary<Player, ObservationSerializer> teamObservationSerializers = new();
++		readonly SemaphoreSlim rpcOperationLock = new(1, 1);
++		volatile bool teamModeActive;
++		volatile bool streamingActive;
++		volatile List<(Player Player, RLProto.AgentAction Action)> pendingTeamActions;
++		int pendingTeamTicks;
++		volatile TaskCompletionSource<RLProto.TeamAdvanceResponse> pendingTeamAdvanceResult;
+ 
+ 		// Channels for async communication between game thread and gRPC stream.
+ 		// DropOldest ensures the game thread never blocks:
+@@ -251,8 +265,14 @@ public void Activate(Player p)
+ 
+ 			IsEnabled = true;
+ 			player = p;
++			controlledPlayers.Clear();
++			controlledPlayers.Add(player);
+ 			observationSerializer = new ObservationSerializer(world, player, episodeId);
+ 			actionHandler = new ActionHandler(world, player);
++			teamObservationSerializers.Clear();
++			foreach (var controlledPlayer in controlledPlayers)
++				teamObservationSerializers.Add(controlledPlayer,
++					controlledPlayer == player ? observationSerializer : new ObservationSerializer(world, controlledPlayer, episodeId));
+ 
+ 			// Register in the session registry
+ 			Sessions[episodeId] = this;
+@@ -302,8 +322,9 @@ internal void Deactivate()
+ 			SessionDone.Set();
+ 			TickRequested.Set(); // Wake tick loop so it can exit
+ 
+-			// Complete any pending FastAdvance so the gRPC call doesn't hang forever
++			// Complete pending unary calls so gRPC requests do not hang after teardown.
+ 			pendingAdvanceResult?.TrySetCanceled();
++			pendingTeamAdvanceResult?.TrySetException(new RpcException(new Status(StatusCode.Aborted, $"Session {episodeId} is no longer active.")));
+ 
+ 			Log.Write("rl-bridge", $"Session {episodeId} deactivated");
+ 		}
+@@ -328,6 +349,19 @@ void ITick.Tick(Actor self)
+ 
+ 				// Complete any pending FastAdvance so the gRPC call returns immediately
+ 				// instead of hanging until the 300s deadline.
++				var teamGameOverTcs = pendingTeamAdvanceResult;
++				if (teamGameOverTcs != null)
++				{
++					try { teamGameOverTcs.TrySetResult(SerializeTeamObservations()); }
++					catch (Exception e) { teamGameOverTcs.TrySetException(e); }
++					pendingTeamAdvanceResult = null;
++					pendingTeamActions = null;
++					pendingTeamTicks = 0;
++					pendingFastAdvanceTarget = 0;
++					world.SetTickScale(1.0f);
++					world.SetLocalPauseState(true);
++				}
++
+ 				var gameOverTcs = pendingAdvanceResult;
+ 				if (gameOverTcs != null)
+ 				{
+@@ -376,6 +410,12 @@ void ITick.Tick(Actor self)
+ 				Log.Write("rl-bridge", $"Internal connection lost at tick {world.WorldTick}! Session {episodeId}.");
+ 
+ 				// Complete any pending FastAdvance so gRPC doesn't hang
++				pendingTeamAdvanceResult?.TrySetException(new RpcException(new Status(StatusCode.Unavailable, "World connection was lost.")));
++				pendingTeamAdvanceResult = null;
++				pendingFastAdvanceTarget = 0;
++				pendingTeamActions = null;
++				pendingTeamTicks = 0;
++				world.SetTickScale(1.0f);
+ 				var connLostTcs = pendingAdvanceResult;
+ 				if (connLostTcs != null)
+ 				{
+@@ -442,6 +482,21 @@ void ITick.Tick(Actor self)
+ 					Log.Write("rl-bridge", $"Fast-forward complete at tick {world.WorldTick}, restored normal speed");
+ 				pendingFastAdvanceTarget = 0;
+ 
++				// Team batches complete together so every slot receives the same world tick.
++				var teamTcs = pendingTeamAdvanceResult;
++				if (teamTcs != null)
++				{
++					try
++					{
++						world.SetLocalPauseState(true);
++						teamTcs.TrySetResult(SerializeTeamObservations());
++					}
++					catch (Exception e) { teamTcs.TrySetException(e); }
++					pendingTeamAdvanceResult = null;
++					pendingTeamActions = null;
++					pendingTeamTicks = 0;
++				}
++
+ 				// Complete unary FastAdvance if pending
+ 				var advTcs = pendingAdvanceResult;
+ 				if (advTcs != null)
+@@ -504,6 +559,43 @@ void ITick.Tick(Actor self)
+ 				agentConnected = false;
+ 			}
+ 
++			var teamActions = pendingTeamActions;
++			if (teamActions != null)
++			{
++				// Consume once; retaining the batch would restart its target every tick.
++				pendingTeamActions = null;
++				try
++				{
++					// Validate the complete batch before queueing any order, so a bad slot or
++					// hidden/allied attack target cannot leave a partially applied team action.
++					foreach (var batch in teamActions)
++					{
++						var handler = new ActionHandler(world, batch.Player);
++						if (!handler.ValidateAction(batch.Action, out var error))
++							throw new RpcException(new Status(StatusCode.InvalidArgument,
++								$"Invalid command for {batch.Player.InternalName}: {error}"));
++					}
++
++					foreach (var batch in teamActions)
++						new ActionHandler(world, batch.Player).ProcessAction(batch.Action, this);
++
++					fastAdvanceStartTick = world.WorldTick;
++					pendingFastAdvanceTarget = world.WorldTick + pendingTeamTicks;
++					world.SetTickScale(0.025f);
++					Log.Write("rl-bridge", $"Team fast-forward: {pendingTeamTicks} ticks from {world.WorldTick} to {pendingFastAdvanceTarget}");
++				}
++				catch (Exception e)
++				{
++					pendingTeamAdvanceResult?.TrySetException(e);
++					pendingTeamAdvanceResult = null;
++					pendingTeamActions = null;
++					pendingTeamTicks = 0;
++					pendingFastAdvanceTarget = 0;
++					world.SetTickScale(1.0f);
++					world.SetLocalPauseState(true);
++				}
++			}
++
+ 			// Issue any queued orders
+ 			while (orders.Count > 0)
+ 				world.IssueOrder(orders.Dequeue());
+@@ -535,6 +627,32 @@ void ITick.Tick(Actor self)
+ 		/// <summary>
+ 		/// Called by RLBridgeService to signal that an agent has connected.
+ 		/// </summary>
++		internal void OnStreamingConnected()
++		{
++			rpcOperationLock.Wait();
++			try
++			{
++				if (teamModeActive)
++					throw new RpcException(new Status(StatusCode.FailedPrecondition,
++						"GameSession cannot be started after team control has begun."));
++
++				streamingActive = true;
++				OnAgentConnected();
++			}
++			finally { rpcOperationLock.Release(); }
++		}
++
++		internal void OnStreamingDisconnected()
++		{
++			rpcOperationLock.Wait();
++			try
++			{
++				streamingActive = false;
++				OnAgentDisconnected();
++			}
++			finally { rpcOperationLock.Release(); }
++		}
++
+ 		internal void OnAgentConnected()
+ 		{
+ 			agentConnected = true;
+@@ -849,15 +967,217 @@ void UpdateMovingUnits()
+ 			}
+ 		}
+ 
++		/// <summary>Read synchronized observations for the configured team slots.</summary>
++		internal async Task<RLProto.TeamAdvanceResponse> RequestTeamState(CancellationToken ct)
++		{
++			await WaitTeamReady(ct);
++			await rpcOperationLock.WaitAsync(ct);
++			try
++			{
++				if (streamingActive)
++					throw new RpcException(new Status(StatusCode.FailedPrecondition, "Team RPCs cannot run while GameSession streaming is active."));
++				if (SessionDone.IsSet)
++					throw new RpcException(new Status(StatusCode.Aborted, $"Session {episodeId} is no longer active"));
++				teamModeActive = true;
++
++				var tcs = new TaskCompletionSource<RLProto.TeamAdvanceResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
++				if (MultiSessionMode)
++				{
++					var workItem = await SubmitSessionOperation(() => tcs.TrySetResult(SerializeTeamObservations()));
++					await workItem.Completed.Task;
++				}
++				else
++				{
++					// Delayed callbacks run on the game thread even while the World is
++					// paused. Snapshot without allowing an unsolicited simulation tick.
++					Game.RunAfterTick(() =>
++					{
++						world.SetLocalPauseState(true);
++						try { tcs.TrySetResult(SerializeTeamObservations()); }
++						catch (Exception e) { tcs.TrySetException(e); }
++					});
++				}
++
++				return await tcs.Task;
++			}
++			finally
++			{
++				rpcOperationLock.Release();
++			}
++		}
++
++		internal async Task<RLProto.TeamAdvanceResponse> RequestTeamAdvance(
++			RLProto.TeamAdvanceRequest request, CancellationToken ct)
++		{
++			await WaitTeamReady(ct);
++			await rpcOperationLock.WaitAsync(ct);
++			try
++			{
++				if (streamingActive)
++					throw new RpcException(new Status(StatusCode.FailedPrecondition, "Team RPCs cannot run while GameSession streaming is active."));
++				if (SessionDone.IsSet)
++					throw new RpcException(new Status(StatusCode.Aborted, $"Session {episodeId} is no longer active"));
++
++				var batches = new List<(Player Player, RLProto.AgentAction Action)>();
++				var seenPlayers = new HashSet<string>(StringComparer.Ordinal);
++				foreach (var playerAction in request.PlayerActions)
++				{
++					var controlledPlayer = controlledPlayers.FirstOrDefault(p => p.InternalName == playerAction.PlayerId);
++					if (controlledPlayer == null)
++						throw new RpcException(new Status(StatusCode.PermissionDenied,
++							$"Player '{playerAction.PlayerId}' is not controlled by this bridge."));
++					if (!seenPlayers.Add(playerAction.PlayerId))
++						throw new RpcException(new Status(StatusCode.InvalidArgument,
++							$"Duplicate action batch for player '{playerAction.PlayerId}'."));
++					if (playerAction.Action == null)
++						throw new RpcException(new Status(StatusCode.InvalidArgument,
++							$"Action batch for player '{playerAction.PlayerId}' is missing action."));
++
++					batches.Add((controlledPlayer, playerAction.Action.Clone()));
++				}
++
++				teamModeActive = true;
++				var tcs = new TaskCompletionSource<RLProto.TeamAdvanceResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
++				pendingInterruptReason = null;
++				interruptCheckInterval = 0;
++				pendingTeamTicks = Math.Max(1, Math.Min(request.Ticks, 5000));
++				pendingTeamActions = batches;
++				pendingTeamAdvanceResult = tcs;
++				if (!agentConnected)
++					OnAgentConnected();
++				else
++					world.SetLocalPauseState(false);
++
++				if (MultiSessionMode)
++				{
++					try
++					{
++						var workItem = await SubmitSessionOperation(null);
++						await workItem.Completed.Task;
++					}
++					catch
++					{
++						if (pendingTeamAdvanceResult == tcs)
++						{
++							pendingTeamAdvanceResult = null;
++							pendingTeamActions = null;
++							pendingTeamTicks = 0;
++							world.SetLocalPauseState(true);
++						}
++						throw;
++					}
++				}
++				// In legacy mode, the ordinary game loop advances the queued request;
++				// in multi-session mode, the worker completed the same queued batch.
++				return await tcs.Task;
++			}
++			finally
++			{
++				rpcOperationLock.Release();
++			}
++		}
++
++		async Task<RLSessionManager.WorkItem> SubmitSessionOperation(Action operation)
++		{
++			RLSessionManager.SessionState state = null;
++			for (var retry = 0; retry < 50; retry++)
++			{
++				if (RLSessionManager.SessionStates.TryGetValue(episodeId, out state))
++					break;
++				await Task.Delay(100);
++			}
++
++			if (state == null)
++				throw new RpcException(new Status(StatusCode.NotFound, $"Session state not found for {episodeId}"));
++
++			var item = operation == null
++				? RLSessionManager.SubmitWork(state, this)
++				: RLSessionManager.SubmitOperation(state, this, operation);
++			if (item == null)
++				throw new RpcException(new Status(StatusCode.ResourceExhausted, "All worker slots busy, retry later"));
++
++			return item;
++		}
++
++		RLProto.TeamAdvanceResponse SerializeTeamObservations()
++		{
++			var response = new RLProto.TeamAdvanceResponse { Tick = world.WorldTick };
++			foreach (var controlledPlayer in controlledPlayers)
++				response.Observations.Add(new RLProto.TeamObservation
++				{
++					PlayerId = controlledPlayer.InternalName,
++					Observation = teamObservationSerializers[controlledPlayer].Serialize(world.WorldTick),
++				});
++
++			return response;
++		}
++
++		void IWorldLoaded.WorldLoaded(World w, WorldRenderer wr)
++		{
++			if (!IsEnabled)
++				return;
++
++			try { InitializeTeamPlayers(); }
++			catch (Exception e) { teamInitializationError = e.Message; }
++			finally { teamReady = true; }
++		}
++
++		void InitializeTeamPlayers()
++		{
++			// Activate runs during Player construction, before World.Players and
++			// relationship masks exist. Resolve the allowlist only after loading.
++			var configured = Environment.GetEnvironmentVariable("RL_CONTROLLED_PLAYERS") ?? info.ControlledPlayers;
++			foreach (var name in configured.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
++			{
++				var other = world.Players.FirstOrDefault(p => p.InternalName == name);
++				if (other == player)
++					continue;
++				if (other == null || !other.Playable || other.NonCombatant || other.Spectating
++					|| other.BotType != "dummy" || !player.IsAlliedWith(other))
++					throw new InvalidOperationException($"RL controlled slot '{name}' must be an allied playable dummy bot.");
++				if (!controlledPlayers.Contains(other))
++				{
++					controlledPlayers.Add(other);
++					teamObservationSerializers.Add(other, new ObservationSerializer(world, other, episodeId));
++				}
++			}
++		}
++
++		async Task WaitTeamReady(CancellationToken ct)
++		{
++			while (!teamReady)
++				await Task.Delay(10, ct);
++			if (teamInitializationError != null)
++				throw new RpcException(new Status(StatusCode.FailedPrecondition, teamInitializationError));
++		}
++
++		internal bool TeamModeActive => teamModeActive;
++
+ 		/// <summary>
+ 		/// Unary FastAdvance: submit commands, fast-forward N ticks, return observation.
+-		/// In multi-session mode, acquires a worker slot and ticks inline on the
+-		/// calling (gRPC) thread. Returns RESOURCE_EXHAUSTED if all workers are busy.
+-		/// In single-session mode, routes through the action channel to the game thread.
++		/// The lock covers the entire world operation to serialize unary RPCs.
+ 		/// </summary>
+ 		internal async Task<RLProto.GameObservation> RequestFastAdvance(
+ 			int ticks, IEnumerable<RLProto.Command> commands, CancellationToken ct,
+ 			int checkEventsEvery = 0, IEnumerable<string> enabledInterruptNames = null)
++		{
++			await rpcOperationLock.WaitAsync(ct);
++			try
++			{
++				if (teamModeActive || streamingActive)
++					throw new RpcException(new Status(StatusCode.FailedPrecondition,
++						"FastAdvance cannot be combined with team control or GameSession streaming."));
++				return await RequestFastAdvanceLocked(ticks, commands, ct, checkEventsEvery, enabledInterruptNames);
++			}
++			finally
++			{
++				rpcOperationLock.Release();
++			}
++		}
++
++		async Task<RLProto.GameObservation> RequestFastAdvanceLocked(
++			int ticks, IEnumerable<RLProto.Command> commands, CancellationToken ct,
++			int checkEventsEvery, IEnumerable<string> enabledInterruptNames)
+ 		{
+ 			// Fail fast if session is already dead
+ 			if (SessionDone.IsSet)
+@@ -927,13 +1247,8 @@ void UpdateMovingUnits()
+ 					throw new RpcException(new Status(StatusCode.ResourceExhausted,
+ 						"All worker slots busy, retry later"));
+ 
+-				using var reg = ct.Register(() =>
+-				{
+-					tcs.TrySetCanceled();
+-					workItem.Completed.TrySetCanceled();
+-				});
+-
+-				// Wait for the worker to finish ticking (non-blocking await)
++				// Once enqueued, keep the bridge operation lock until the world operation
++				// completes even if the client cancels its RPC.
+ 				await workItem.Completed.Task;
+ 				return await tcs.Task;
+ 			}
+@@ -942,7 +1257,6 @@ void UpdateMovingUnits()
+ 				// Legacy single-session mode: delegate to the game thread
+ 				TickRequested.Set();
+ 
+-				using var reg = ct.Register(() => tcs.TrySetCanceled());
+ 				return await tcs.Task;
+ 			}
+ 		}
+diff --git a/OpenRA.Mods.Common/Traits/Player/ObservationSerializer.cs b/OpenRA.Mods.Common/Traits/Player/ObservationSerializer.cs
+index 69cea95..a1bffcc 100644
+--- a/OpenRA.Mods.Common/Traits/Player/ObservationSerializer.cs
++++ b/OpenRA.Mods.Common/Traits/Player/ObservationSerializer.cs
+@@ -60,6 +60,7 @@ public RLProto.GameObservation Serialize(int tick)
+ 			{
+ 				Tick = tick,
+ 				EpisodeId = episodeId,
++				ControlledPlayerId = player.InternalName,
+ 				Economy = SerializeEconomy(),
+ 				Military = SerializeMilitary(),
+ 				MapInfo = SerializeMapInfo(),
+@@ -73,8 +74,10 @@ public RLProto.GameObservation Serialize(int tick)
+ 					: "draw";
+ 			}
+ 
++			SerializePlayerRoster(obs);
+ 			SerializeOwnedActors(obs);
+ 			SerializeVisibleEnemies(obs);
++			SerializeVisibleAllies(obs);
+ 			SerializeProduction(obs);
+ 			SerializeSpatialMap(obs);
+ 
+@@ -188,6 +191,51 @@ void SerializeOwnedActors(RLProto.GameObservation obs)
+ 			}
+ 		}
+ 
++		void SerializePlayerRoster(RLProto.GameObservation obs)
++		{
++			foreach (var other in world.Players)
++			{
++				var relationship = other == player ? "self"
++					: player.IsAlliedWith(other) ? "ally"
++					: player.RelationshipWith(other) == PlayerRelationship.Enemy ? "enemy" : "neutral";
++
++				obs.PlayerRoster.Add(new RLProto.RlPlayerRosterEntry
++				{
++					PlayerId = other.InternalName,
++					Relationship = relationship,
++				});
++			}
++		}
++
++		void SerializeVisibleAllies(RLProto.GameObservation obs)
++		{
++			foreach (var actor in world.Actors)
++			{
++				if (actor.Owner == null || actor.Owner == player || !player.IsAlliedWith(actor.Owner)
++					|| actor.IsDead || !actor.IsInWorld || actor.Owner.NonCombatant
++					|| actor == world.WorldActor || actor == actor.Owner.PlayerActor)
++					continue;
++
++				try
++				{
++					// Use the observing player's shroud, matching enemy visibility rules.
++					if (!player.Shroud.IsVisible(actor.CenterPosition))
++						continue;
++
++					var health = actor.TraitOrDefault<Health>();
++					var hpPercent = health != null ? (float)health.HP / health.MaxHP : 1f;
++					if (actor.Info.HasTraitInfo<BuildingInfo>())
++						obs.AlliedBuildings.Add(SerializeBuilding(actor, hpPercent, actor.Owner.InternalName));
++					else
++						obs.AlliedUnits.Add(SerializeUnit(actor, hpPercent, actor.Owner.InternalName));
++				}
++				catch (NullReferenceException)
++				{
++					// Actor may be in a transitional state — skip it.
++				}
++			}
++		}
++
+ 		void SerializeVisibleEnemies(RLProto.GameObservation obs)
+ 		{
+ 			var enemyCount = 0;
+@@ -195,7 +243,7 @@ void SerializeVisibleEnemies(RLProto.GameObservation obs)
+ 			var buildingCount = 0;
+ 			foreach (var actor in world.Actors)
+ 			{
+-				if (actor.Owner == player || actor.Owner.NonCombatant
++				if (actor.Owner == player || player.IsAlliedWith(actor.Owner) || actor.Owner.NonCombatant
+ 					|| actor.IsDead || !actor.IsInWorld)
+ 					continue;
+ 
+@@ -458,7 +506,8 @@ void SerializeSpatialMap(RLProto.GameObservation obs)
+ 					else if (actor != player.PlayerActor)
+ 						ownUnitDensity[idx]++;
+ 				}
+-				else if (shroud.IsVisible(actor.CenterPosition))
++				else if (player.RelationshipWith(actor.Owner) == PlayerRelationship.Enemy
++					&& shroud.IsVisible(actor.CenterPosition))
+ 				{
+ 					if (actor.Info.HasTraitInfo<BuildingInfo>())
+ 						enemyBuildingCells[idx] = true;
+diff --git a/OpenRA.Mods.Common/Traits/Player/Protos/rl_bridge.proto b/OpenRA.Mods.Common/Traits/Player/Protos/rl_bridge.proto
+index 1017ebe..fc3fea2 100644
+--- a/OpenRA.Mods.Common/Traits/Player/Protos/rl_bridge.proto
++++ b/OpenRA.Mods.Common/Traits/Player/Protos/rl_bridge.proto
+@@ -19,6 +19,11 @@ service RLBridge {
+   // Bypasses streaming — works reliably on all platforms.
+   rpc FastAdvance(FastAdvanceRequest) returns (GameObservation);
+ 
++  // Coordinated action/advance for the explicitly configured allied player slots.
++  rpc TeamAdvance(TeamAdvanceRequest) returns (TeamAdvanceResponse);
++  // Current observations for all configured allied player slots.
++  rpc TeamState(StateRequest) returns (TeamAdvanceResponse);
++
+   // Session management (multi-session mode)
+   rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
+   rpc DestroySession(DestroySessionRequest) returns (DestroySessionResponse);
+@@ -63,6 +68,17 @@ message GameObservation {
+   bool interrupted = 18;           // true if advance ended early due to interrupt
+   string interrupt_reason = 19;    // signal name (e.g. "enemy_spotted")
+   int32 actual_ticks_advanced = 20; // ticks actually advanced (may be < requested)
++
++  // Identity and allies are additive; legacy single-player observations are unchanged.
++  string controlled_player_id = 21;
++  repeated RlPlayerRosterEntry player_roster = 22;
++  repeated RlUnitInfo allied_units = 23;
++  repeated RlBuildingInfo allied_buildings = 24;
++}
++
++message RlPlayerRosterEntry {
++  string player_id = 1;       // Player internal name
++  string relationship = 2;   // "self", "ally", "enemy", or "neutral"
+ }
+ 
+ message RlEconomy {
+@@ -210,6 +226,27 @@ message StateRequest {
+ 
+ // ─── Fast Advance (Unary) ───────────────────────────────────────────────────
+ 
++message TeamPlayerAction {
++  string player_id = 1; // Must identify an explicitly configured allied slot.
++  AgentAction action = 2;
++}
++
++message TeamAdvanceRequest {
++  int32 ticks = 1;
++  repeated TeamPlayerAction player_actions = 2;
++  string session_id = 3;
++}
++
++message TeamAdvanceResponse {
++  int32 tick = 1;
++  repeated TeamObservation observations = 2;
++}
++
++message TeamObservation {
++  string player_id = 1;
++  GameObservation observation = 2;
++}
++
+ message FastAdvanceRequest {
+   int32 ticks = 1;
+   repeated Command commands = 2;
+diff --git a/OpenRA.Mods.Common/Traits/Player/RLBridgeService.cs b/OpenRA.Mods.Common/Traits/Player/RLBridgeService.cs
+index dd6063b..fb7fed6 100644
+--- a/OpenRA.Mods.Common/Traits/Player/RLBridgeService.cs
++++ b/OpenRA.Mods.Common/Traits/Player/RLBridgeService.cs
+@@ -80,7 +80,11 @@ public override async Task GameSession(
+ 				return;
+ 			}
+ 
+-			bridge.OnAgentConnected();
++			if (bridge.TeamModeActive)
++				throw new RpcException(new Status(StatusCode.FailedPrecondition,
++					"GameSession cannot be started after team control has begun."));
++
++			bridge.OnStreamingConnected();
+ 			Log.Write("rl-bridge", $"GameSession started for session {bridge.SessionId}");
+ 
+ 			var ct = context.CancellationToken;
+@@ -124,7 +128,7 @@ public override async Task GameSession(
+ 			}
+ 			finally
+ 			{
+-				bridge.OnAgentDisconnected();
++				bridge.OnStreamingDisconnected();
+ 				Log.Write("rl-bridge", "GameSession ended");
+ 			}
+ 		}
+@@ -165,6 +169,40 @@ public override async Task GameSession(
+ 			}
+ 		}
+ 
++		/// <summary>
++		/// Advance one coordinated team action batch and return an observation for each controlled slot.
++		/// </summary>
++		public override async Task<RLProto.TeamAdvanceResponse> TeamAdvance(
++			RLProto.TeamAdvanceRequest request, ServerCallContext context)
++		{
++			var bridge = await WaitForBridge(request.SessionId, context.CancellationToken);
++			if (bridge == null)
++				throw new RpcException(new Status(StatusCode.Unavailable,
++					$"Bridge not activated within 300s (session_id={request.SessionId})"));
++
++			if (RLSessionManager.SessionStates.TryGetValue(request.SessionId, out var sessionState))
++				sessionState.TouchActivity();
++
++			return await bridge.RequestTeamAdvance(request, context.CancellationToken);
++		}
++
++		/// <summary>
++		/// Read synchronized observations for each configured team slot.
++		/// </summary>
++		public override async Task<RLProto.TeamAdvanceResponse> TeamState(
++			RLProto.StateRequest request, ServerCallContext context)
++		{
++			var bridge = await WaitForBridge(request.SessionId, context.CancellationToken);
++			if (bridge == null)
++				throw new RpcException(new Status(StatusCode.Unavailable,
++					$"Bridge not activated within 300s (session_id={request.SessionId})"));
++
++			if (RLSessionManager.SessionStates.TryGetValue(request.SessionId, out var sessionState))
++				sessionState.TouchActivity();
++
++			return await bridge.RequestTeamState(context.CancellationToken);
++		}
++
+ 		/// <summary>
+ 		/// Unary RPC: query current game state on demand.
+ 		/// </summary>
+diff --git a/OpenRA.Mods.Common/Traits/Player/RLSessionManager.cs b/OpenRA.Mods.Common/Traits/Player/RLSessionManager.cs
+index ee9ac91..621ab7b 100644
+--- a/OpenRA.Mods.Common/Traits/Player/RLSessionManager.cs
++++ b/OpenRA.Mods.Common/Traits/Player/RLSessionManager.cs
+@@ -86,9 +86,15 @@ internal sealed class WorkItem
+ 		{
+ 			public readonly SessionState State;
+ 			public readonly ExternalBotBridge Bridge;
++			public readonly Action Operation;
+ 			public readonly TaskCompletionSource<bool> Completed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+ 
+-			public WorkItem(SessionState s, ExternalBotBridge b) { State = s; Bridge = b; }
++			public WorkItem(SessionState s, ExternalBotBridge b, Action operation = null)
++			{
++				State = s;
++				Bridge = b;
++				Operation = operation;
++			}
+ 		}
+ 
+ 		/// <summary>Bounded work queue. If full, FastAdvance returns RESOURCE_EXHAUSTED.</summary>
+@@ -187,7 +193,14 @@ static void WorkerLoop()
+ 						GlobalTickSemaphore.Wait();
+ 						try
+ 						{
+-							TickSession(state, item.Bridge);
++							if (item.Operation != null)
++								Sync.RunUnsynced(false, state.World, () =>
++								{
++									item.Operation();
++									return true;
++								});
++							else
++								TickSession(state, item.Bridge);
+ 						}
+ 						finally
+ 						{
+@@ -220,7 +233,17 @@ static void WorkerLoop()
+ 		/// </summary>
+ 		internal static WorkItem SubmitWork(SessionState state, ExternalBotBridge bridge)
+ 		{
+-			var item = new WorkItem(state, bridge);
++			return SubmitWorkItem(state, bridge, null);
++		}
++
++		internal static WorkItem SubmitOperation(SessionState state, ExternalBotBridge bridge, Action operation)
++		{
++			return SubmitWorkItem(state, bridge, operation);
++		}
++
++		static WorkItem SubmitWorkItem(SessionState state, ExternalBotBridge bridge, Action operation)
++		{
++			var item = new WorkItem(state, bridge, operation);
+ 			if (!workQueue.TryAdd(item, TimeSpan.FromSeconds(5)))
+ 				return null; // Queue persistently full — caller should return RESOURCE_EXHAUSTED
+ 
