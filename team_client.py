@@ -27,6 +27,9 @@ def _unit(raw: Any, owner: str | None = None) -> dict[str, Any]:
     }
     for key in ("ammo", "attack_range", "is_building"):
         result[key] = _value(raw, key, False if key == "is_building" else 0)
+    result["can_produce"] = list(_value(raw, "can_produce", []))
+    for key in ("is_powered", "is_producing", "production_progress", "power_amount", "rally_x", "rally_y"):
+        result[key] = _value(raw, key, 0 if key in {"production_progress", "power_amount", "rally_x", "rally_y"} else False)
     return result
 
 
@@ -64,6 +67,7 @@ def normalize_observation(obs: Any) -> dict[str, Any]:
         "available_production": list(_value(obs, "available_production", [])),
         "production": production, "production_items": production_items,
         "building_types": [u["type"] for u in own_buildings],
+        "building_capabilities": {u["type"]: list(u.get("can_produce", [])) for u in own_buildings if u.get("can_produce")},
         "economy": {key: _value(economy, key, 0) for key in ("cash", "ore", "power_provided", "power_drained", "resource_capacity", "harvester_count")},
         "military": {key: _value(_value(obs, "military", None), key, 0) for key in ("units_killed", "units_lost", "army_value", "active_unit_count")},
         "map": {"width": int(_value(map_info, "width", 0)), "height": int(_value(map_info, "height", 0)), "map_name": str(_value(map_info, "map_name", ""))},
@@ -228,6 +232,31 @@ class TeamPlayerAdapter:
     def __init__(self, coordinator: TeamCoordinator, player_id: str) -> None:
         self.coordinator, self.player_id = coordinator, player_id
 
+    @staticmethod
+    def _default_build_target(state: Mapping[str, Any]) -> tuple[int, int]:
+        buildings = state.get("buildings_summary") or state.get("buildings") or []
+        anchor = next((b for b in buildings if b.get("type") == "fact"), None) or (buildings[0] if buildings else None)
+        if anchor is None:
+            units = state.get("units_summary") or state.get("units") or []
+            anchor = units[0] if units else None
+        try:
+            ax = int(anchor.get("cell_x", anchor.get("x", 0))) if anchor else 0
+            ay = int(anchor.get("cell_y", anchor.get("y", 0))) if anchor else 0
+        except (TypeError, ValueError):
+            ax, ay = 0, 0
+        occupied = {(int(b.get("cell_x", b.get("x", -999))), int(b.get("cell_y", b.get("y", -999))))
+                    for b in buildings}
+        map_info = state.get("map") or {}
+        width, height = int(map_info.get("width", 0) or 0), int(map_info.get("height", 0) or 0)
+        candidates = [(ax + 3, ay), (ax - 3, ay), (ax, ay + 3), (ax, ay - 3),
+                      (ax + 4, ay + 2), (ax - 4, ay + 2), (ax + 2, ay - 4), (ax - 2, ay - 4)]
+        for x, y in candidates:
+            if width > 0 and not (0 <= x < width and 0 <= y < height):
+                continue
+            if (x, y) not in occupied:
+                return x, y
+        return max(0, ax), max(0, ay)
+
     async def call_tool(self, name: str, **kwargs: Any) -> Any:
         state = self.coordinator.states[self.player_id]
         if name == "get_game_state":
@@ -243,12 +272,16 @@ class TeamPlayerAdapter:
                     return result
             if is_building:
                 x, y = kwargs.get("cell_x"), kwargs.get("cell_y")
+                if x is None or y is None:
+                    x, y = self._default_build_target(state)
                 baseline = sum(1 for building in state["buildings_summary"] if building["type"] == kind)
                 baseline += sum(1 for placement in self.coordinator.placements[self.player_id] if placement["item"] == kind)
                 self.coordinator.placements[self.player_id].append({
-                    "item": kind, "target": (int(x), int(y)) if x is not None and y is not None else None,
+                    "item": kind, "target": (int(x), int(y)),
                     "baseline_buildings": baseline, "completed": False, "sent": False,
                 })
+                if isinstance(result, dict):
+                    result["target"] = [int(x), int(y)]
             return result
         if name == "deploy_unit":
             return self.coordinator.command(self.player_id, "DEPLOY", actor_id=int(kwargs["unit_id"]))

@@ -56,6 +56,15 @@ Use only supplied actor ids and available_production. BUILD_UNIT needs unit_type
 BUILD_STRUCTURE needs structure_type, and DEPLOY needs an owned deployable unit id.
 ATTACK needs a visible enemy; MOVE needs a map cell; RETREAT returns to base;
 HOLD stops units. Never invent ids. Keep reason under 20 words.
+Economy guidance: DEPLOY the owned MCV before building. For BUILD_STRUCTURE,
+only choose a structure in available_production, do not repeat an item already
+in production, and always include a target near your fact using a free map cell.
+Prefer a stable opening of powr, one tent/barr, proc, then weap when those
+items are advertised as available. For BUILD_UNIT, choose only an advertised
+unit with its producer available and respect cash, remaining production costs,
+and the 500 cash reserve. If combat units exist and enemies are visible,
+prioritize ATTACK or MOVE over another economy order. If no combat units exist,
+fix production/economy instead of issuing a combat action.
 """
 
 
@@ -415,16 +424,29 @@ class RCDVLM:
         self.timeout = timeout
         self.session = requests.Session()
 
-    def choose(self, state: Mapping[str, Any], personality: str = "balanced") -> tuple[Action, str]:
+    def choose(self, state: Mapping[str, Any], personality: str = "balanced",
+               feedback: Mapping[str, Any] | None = None) -> tuple[Action, str]:
         guidance = {
             "selfish": "Prioritize own base and army; retreat from enemies outside 18 cells of your base, and never assume ally support.",
             "helpful": "Defend own base if an enemy is within 18 cells; otherwise help explicitly observed allies threatened within 12 cells.",
             "balanced": "Defend own base within 18 cells; otherwise help explicitly observed allies threatened within 8 cells."
         }[personality]
+        feedback_text = ""
+        if feedback:
+            compact = {key: feedback[key] for key in (
+                "requested_action", "submitted_action", "validation", "queue_result",
+                "bootstrap_result", "advance_result", "model_error", "llm_response"
+            ) if key in feedback}
+            feedback_text = (
+                "\\nLatest feedback for the previous order (use current state as authoritative; "
+                "do not repeat a rejected order):\\n"
+                + json.dumps(compact, separators=(",", ":"), sort_keys=True, default=str)
+            )
         prompt = (
             f"Personality: {guidance}\\n"
             "Structured OpenRA-RL game state (authoritative for actor ids and map cells):\n"
             + json.dumps(state, separators=(",", ":"), sort_keys=True)
+            + feedback_text
             + "\nReturn the JSON action now."
         )
         request = {
@@ -433,7 +455,7 @@ class RCDVLM:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
-            "max_tokens": 1024,
+            "max_tokens": 2048,
             "temperature": 0.1,
             "response_format": {"type": "json_object"},
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
@@ -441,8 +463,17 @@ class RCDVLM:
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         response = self.session.post(self.url, headers=headers, json=request, timeout=self.timeout)
         response.raise_for_status()
-        text = _message_text(response.json())
-        return parse_action(text), text
+        payload = response.json()
+        text = _message_text(payload)
+        try:
+            action = parse_action(text)
+        except Exception as exc:
+            choices = payload.get("choices") or []
+            choice = choices[0] if choices and isinstance(choices[0], Mapping) else {}
+            setattr(exc, "llm_finish_reason", choice.get("finish_reason"))
+            setattr(exc, "llm_usage", payload.get("usage"))
+            raise
+        return action, text
 
 
 class BootstrapController:
@@ -547,6 +578,7 @@ class DecisionEngine:
         self.vlm = vlm
         self.output_dir = output_dir
         self.log_path = output_dir / "events.jsonl"
+        self.last_feedback: dict[str, Any] = {}
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def log(self, record: Mapping[str, Any]) -> None:
@@ -554,19 +586,27 @@ class DecisionEngine:
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, sort_keys=True, default=str) + "\n")
 
-    def decide(self, state: Mapping[str, Any]) -> Action:
+    def decide(self, state: Mapping[str, Any], feedback: Mapping[str, Any] | None = None) -> Action:
         started = time.perf_counter()
         raw_text = ""
         error = None
+        response_meta: dict[str, Any] = {}
         if self.vlm is None:
             action = fallback_action(state, self.personality)
             source = "fallback"
         else:
             try:
-                action, raw_text = self.vlm.choose(state, self.personality)
+                if feedback is None:
+                    action, raw_text = self.vlm.choose(state, self.personality)
+                else:
+                    action, raw_text = self.vlm.choose(state, self.personality, feedback)
                 source = "vlm"
             except Exception as exc:  # keep the episode alive if the model fails
                 action, error = fallback_action(state, self.personality), str(exc)
+                response_meta = {
+                    "finish_reason": getattr(exc, "llm_finish_reason", None),
+                    "usage": getattr(exc, "llm_usage", None),
+                }
                 source = "fallback"
         proposed_action = action
         action = sanitize_action(action, state)
@@ -574,6 +614,15 @@ class DecisionEngine:
             action = Action("HOLD", [], reason="economy controlled by bootstrap")
         sanitized = proposed_action != action
         decision_source = "vlm_rejected" if sanitized and source == "vlm" else source
+        self.last_feedback = {
+            "requested_action": asdict(proposed_action),
+            "submitted_action": asdict(action),
+            "validation": "rejected" if sanitized else "accepted",
+        }
+        if error:
+            self.last_feedback["model_error"] = error
+        if response_meta.get("finish_reason") is not None or response_meta.get("usage") is not None:
+            self.last_feedback["llm_response"] = response_meta
         self.log(
             {
                 "event": "decision",
@@ -587,6 +636,8 @@ class DecisionEngine:
                 "action": asdict(action),
                 "raw_model_response": raw_text[:2000],
                 "error": error,
+                "llm_response": response_meta or None,
+                "decision_feedback": self.last_feedback,
             }
         )
         return action
